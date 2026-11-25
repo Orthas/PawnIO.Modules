@@ -1,0 +1,40 @@
+# TEMPORARY - diagnostic only, never part of the pull request.
+# Compiles LpcHpKbcNotify.p alone, publishes the compiler output as
+# annotations (readable without sign-in) and fails on any warning/error.
+name: check-lpchpkbcnotify
+
+on:
+  push:
+    branches: [ci-check-lpchpkbcnotify]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container:
+      image: oraclelinux:9
+    steps:
+      - name: Install git
+        run: dnf install -yq git
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Install pawn
+        run: dnf install -yq _pawn/pawn-*.x86_64.rpm
+      - name: Compile LpcHpKbcNotify.p
+        shell: bash
+        run: |
+          set +e
+          pawncc LpcHpKbcNotify.p '-iinclude' '-C64' '-;+' '-(+' '-p' > out.txt 2>&1
+          rc=$?
+          cat out.txt
+          n=0
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            n=$((n+1)); [ $n -gt 9 ] && break
+            echo "::notice title=pawncc line $n::$line"
+          done < out.txt
+          if [ -f LpcHpKbcNotify.amx ]; then
+            echo "::notice title=result::exit=$rc amx=$(stat -c %s LpcHpKbcNotify.amx) bytes"
+          else
+            echo "::error title=result::exit=$rc amx=NOT BUILT"
+          fi
+          if [ $rc -ne 0 ] || grep -qiE 'warning|error' out.txt; then exit 1; fi
