@@ -73,37 +73,52 @@ jobs:
           if (-not $st) { "::error::signtool not found"; exit 1 }
           "THUMB=$($c.Thumbprint)"   | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
           "SIGNTOOL=$($st.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
-          $lines = @(
-            '@echo off',
-            'copy /y "%~1" "%~2" >nul || exit /b 1',
-            ('"{0}" sign /fd SHA256 /s My /sha1 {1} "%~2"' -f $st.FullName, $c.Thumbprint)
-          )
-          Set-Content -Path sign.cmd -Value $lines -Encoding ascii
-          Get-Content sign.cmd
 
-      - name: Configure and build (PAWNIO_UNRESTRICTED=ON)
+      - name: Configure and build the driver (PAWNIO_UNRESTRICTED=ON)
         shell: pwsh
         run: |
           cmake -S PawnIO -B build -G "Visual Studio 17 2022" -A x64 `
                 -DPAWNIO_UNRESTRICTED=ON `
-                "-DPAWNIO_NAME_FULL=PawnIO-UNRESTRICTED-HWTEST" `
-                "-DSIGN_SCRIPT=$PWD\sign.cmd" 2>&1 | Tee-Object cfg.log
+                "-DPAWNIO_NAME_FULL=PawnIO-UNRESTRICTED-HWTEST" 2>&1 | Tee-Object cfg.log
           if ($LASTEXITCODE) { Get-Content cfg.log -Tail 10 | ForEach-Object { "::error title=configure::$_" }; exit 1 }
-          cmake --build build --config Release --target PawnIO_CAB 2>&1 | Tee-Object build.log
+          cmake --build build --config Release --target PawnIO 2>&1 | Tee-Object build.log
           if ($LASTEXITCODE) {
-            Select-String -Path build.log -Pattern ': error|error [A-Z]+[0-9]+|FAILED' |
+            Select-String -Path build.log -Pattern ': error|error [A-Z]+[0-9]+' |
               Select-Object -First 10 | ForEach-Object { "::error title=build::$($_.Line.Trim())" }
             exit 1
           }
+          Get-ChildItem build -Recurse -Include PawnIO_unsigned.sys, PawnIO.inf |
+            ForEach-Object { "::notice title=built::$($_.FullName) $($_.Length) bytes" }
 
-      - name: Collect, sign catalog, record hashes
+      - name: Sign driver, make and sign catalog, record hashes
         shell: pwsh
         run: |
-          $d = 'build\PawnIO\driver'
-          Get-ChildItem $d | ForEach-Object { "::notice title=built::$($_.Name) $($_.Length) bytes" }
-          Copy-Item "$d\PawnIO.sys", "$d\PawnIO.inf", "$d\PawnIO.cat" out\
-          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMB out\PawnIO.cat
-          if ($LASTEXITCODE) { "::error::catalog signing failed"; exit 1 }
+          function Fail($title, $log) {
+            Get-Content $log | Where-Object { $_.Trim() } | Select-Object -Last 8 |
+              ForEach-Object { "::error title=$title::$_" }
+            exit 1
+          }
+          $sys = Get-ChildItem build -Recurse -Filter PawnIO_unsigned.sys | Select-Object -First 1
+          $inf = Get-ChildItem build -Recurse -Filter PawnIO.inf | Where-Object FullName -match '\\driver\\' | Select-Object -First 1
+          if (-not $sys -or -not $inf) { "::error::built files not found"; exit 1 }
+          New-Item -ItemType Directory pkg | Out-Null
+          Copy-Item $sys.FullName pkg\PawnIO.sys
+          Copy-Item $inf.FullName pkg\PawnIO.inf
+
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMB pkg\PawnIO.sys *> sign-sys.log
+          if ($LASTEXITCODE) { Fail 'sign sys' sign-sys.log }
+
+          $i2c = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter inf2cat.exe |
+                 Sort-Object FullName | Select-Object -Last 1
+          if (-not $i2c) { "::error::inf2cat not found"; exit 1 }
+          "::notice title=inf2cat::$($i2c.FullName)"
+          & $i2c.FullName "/driver:$PWD\pkg" /os:10_X64 /verbose *> inf2cat.log
+          if ($LASTEXITCODE -or -not (Test-Path pkg\PawnIO.cat)) { Fail 'inf2cat' inf2cat.log }
+
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMB pkg\PawnIO.cat *> sign-cat.log
+          if ($LASTEXITCODE) { Fail 'sign cat' sign-cat.log }
+
+          Copy-Item pkg\PawnIO.sys, pkg\PawnIO.inf, pkg\PawnIO.cat out\
           $s = Get-AuthenticodeSignature out\PawnIO.sys
           "::notice title=sys signature::signer $($s.SignerCertificate.Thumbprint) (expected $env:THUMB)"
           if ($s.SignerCertificate.Thumbprint -ne $env:THUMB) { "::error::PawnIO.sys is not signed with the test cert"; exit 1 }
