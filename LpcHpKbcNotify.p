@@ -28,16 +28,22 @@
 //  to a second EC command/data pair at 0x6C (status/command) and 0x68 (data)
 //  instead of the 8042 ports 0x64/0x60.
 //
-//  Reference: SynTP.sys 19.5.35.54 (24 Feb 2020), the routine gated by
-//  KBCNotifyConfig bit 0x20 (sends 0x97 + 0x04/0x05) and the bit-0x80 writer,
-//  which polls status at 0x6C for (status & 0x82) == 0 before the command and
-//  (status & 0x02) == 0 (IBF clear) before the data byte. On the supported
-//  board KBCNotifyConfig is 0xA0. The ports are not claimed by any PnP device
-//  and no DSDT OperationRegion covers them.
+//  Reference: SynTP.sys 19.5.35.54 (24 Feb 2020), the routines gated by
+//  KBCNotifyConfig bit 0x20 (send 0x97 + 0x?4/0x?5) and the bit-0x80 writers
+//  (port pair 0x6C/0x68). With SynTP's "SendClearState" setting (default 1)
+//  the writer waits only for IBF clear before the command, and after the data
+//  byte has been accepted (or on any timeout) writes 0xFF to 0x6C to clear
+//  the EC's transaction state. Without that 0xFF, status bit 7 was observed
+//  to stay set and the notification had no effect on hardware. Data byte:
+//  low nibble 4 (finger down) / 5 (finger up); SynTP's HID-path class adds
+//  flag bits 0x10 / 0x40 in the high nibble. On the supported board
+//  KBCNotifyConfig is 0xA0. The ports are not claimed by any PnP device and
+//  no DSDT OperationRegion covers them.
 //
-//  Scope is deliberately minimal: the module can only write command 0x97 and
-//  data bytes 0x04 / 0x05 to this pair, and only read the status port. It
-//  cannot be used as a general port I/O or EC RAM interface.
+//  Scope is deliberately minimal: the module can only write command 0x97, a
+//  data byte from {0x04,0x05,0x14,0x15,0x44,0x45,0x54,0x55} and the 0xFF
+//  clear-state byte to this pair, and only read the status port. It cannot be
+//  used as a general port I/O or EC RAM interface.
 //
 //  The same notification is sent by SynTP on every touch, so this module does
 //  nothing the platform does not already do in normal use. Callers should set
@@ -51,11 +57,10 @@
 #define EC_DATA_PORT        0x68
 
 #define EC_STS_IBF          0x02    // input buffer full
-#define EC_PREWAIT_DEFAULT  0x82    // SynTP's pre-command mask
+#define EC_PREWAIT_LEGACY   0x82    // SynTP's pre-command mask when SendClearState=0
 
 #define NOTIFY_CMD          0x97
-#define NOTIFY_FINGER_DOWN  0x04
-#define NOTIFY_FINGER_UP    0x05
+#define EC_CLEAR_STATE      0xFF    // SynTP SendClearState terminator
 
 #define EC_POLL_US          50
 #define EC_POLL_COUNT       4000    // 4000 x 50 us = 200 ms per handshake step
@@ -117,31 +122,47 @@ NTSTATUS:ec_wait_clear(mask) {
     return STATUS_IO_TIMEOUT;
 }
 
+// Allowed data bytes: low nibble 4 (finger down) or 5 (finger up), high
+// nibble 0 or any combination of SynTP's 0x10 / 0x40 flag bits.
+bool:is_allowed_code(code) {
+    new lo = code & 0x0F;
+    new hi = code & 0xF0;
+    if (lo != 0x04 && lo != 0x05)
+        return false;
+    return hi == 0x00 || hi == 0x10 || hi == 0x40 || hi == 0x50;
+}
+
 /// Send a touchpad activity notification to the EC (command 0x97).
 ///
 /// This is the same notification HP's SynTP driver sends on every touch. The
 /// EC restarts its keyboard backlight inactivity timer when it receives it.
-/// On timeout nothing further is written for that call.
 ///
-/// @param in [0] = Notification code: 0x04 (finger down) or 0x05 (finger up),
-///               [1] = Pre-command wait mask: 0 for SynTP's default (0x82),
-///                     1 for input-buffer-full only (0x02)
+/// Mode 0 (SynTP default, SendClearState=1): wait for IBF clear, write 0x97,
+/// wait, write the data byte, wait, then write 0xFF to 0x6C. 0xFF is also
+/// written if any wait times out, exactly as SynTP does.
+/// Mode 1 (SendClearState=0): wait for (status & 0x82) == 0 before the
+/// command and never write 0xFF.
+///
+/// @param in [0] = Data byte: 0x04/0x05 (finger down/up), optionally with
+///                 flag bits 0x10 and/or 0x40 set,
+///               [1] = Mode: 0 = SendClearState (default), 1 = legacy
 /// @param in_size Must be 2
 /// @param out [0] = EC status byte (port 0x6C) after the transaction
 /// @param out_size Must be 1
 /// @return An NTSTATUS
-/// @retval STATUS_INVALID_PARAMETER The code or wait-mask selector is not one of the allowed values
+/// @retval STATUS_INVALID_PARAMETER The data byte or mode is not one of the allowed values
 /// @retval STATUS_IO_TIMEOUT The EC did not accept the command or data byte within 200 ms
 DEFINE_IOCTL_SIZED(ioctl_touch_notify, 2, 1) {
     new code = in[0];
-    new mask_sel = in[1];
+    new mode = in[1];
 
-    if (code != NOTIFY_FINGER_DOWN && code != NOTIFY_FINGER_UP)
+    if (!is_allowed_code(code))
         return STATUS_INVALID_PARAMETER;
-    if (mask_sel != 0 && mask_sel != 1)
+    if (mode != 0 && mode != 1)
         return STATUS_INVALID_PARAMETER;
 
-    new prewait = mask_sel == 0 ? EC_PREWAIT_DEFAULT : EC_STS_IBF;
+    new bool:clear_state = mode == 0;
+    new prewait = clear_state ? EC_STS_IBF : EC_PREWAIT_LEGACY;
 
     new NTSTATUS:status = ec_wait_clear(prewait);
     if (NT_SUCCESS(status)) {
@@ -152,6 +173,9 @@ DEFINE_IOCTL_SIZED(ioctl_touch_notify, 2, 1) {
             status = ec_wait_clear(EC_STS_IBF);
         }
     }
+
+    if (clear_state)
+        io_out_byte(EC_STATUS_CMD_PORT, EC_CLEAR_STATE);
 
     out[0] = io_in_byte(EC_STATUS_CMD_PORT);
     return status;
