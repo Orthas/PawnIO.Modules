@@ -1,0 +1,137 @@
+# HARDWARE-TEST BUILD ONLY - never part of a pull request.
+#
+# Builds, for testing LpcHpKbcNotify on real hardware before release:
+#   * PawnIO (pinned upstream commit) with PAWNIO_UNRESTRICTED=ON, which
+#     loads unsigned modules. Signed with a throwaway self-signed test
+#     certificate created on this runner; only its public .cer is kept.
+#   * LpcHpKbcNotify.bin = ULONG 0 (no signature) + compiled .amx, the blob
+#     format vm_load_binary_internal() accepts in an unrestricted build.
+#
+# Output: artifact "HwTest-bundle".
+name: hwtest-unrestricted
+
+on:
+  push:
+    branches: [hwtest-unrestricted]
+  workflow_dispatch:
+
+env:
+  PAWNIO_COMMIT: 9d52965895588b0ffa3703b72eec75ba19f4ccc0
+
+jobs:
+  module:
+    runs-on: ubuntu-latest
+    container:
+      image: oraclelinux:9
+    steps:
+      - name: Install git
+        run: dnf install -yq git
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Install pawn
+        run: dnf install -yq _pawn/pawn-*.x86_64.rpm
+      - name: Compile LpcHpKbcNotify and wrap as unsigned blob
+        shell: bash
+        run: |
+          set -e
+          pawncc LpcHpKbcNotify.p '-iinclude' '-C64' '-;+' '-(+' '-p' 2>&1 | tee out.txt
+          test -f LpcHpKbcNotify.amx
+          if grep -qiE 'warning|error' out.txt; then echo "::error::compiler reported problems"; exit 1; fi
+          mkdir -p out
+          printf '\x00\x00\x00\x00' > out/LpcHpKbcNotify.bin
+          cat LpcHpKbcNotify.amx >> out/LpcHpKbcNotify.bin
+          cp LpcHpKbcNotify.p out/
+          (cd out && sha256sum LpcHpKbcNotify.bin LpcHpKbcNotify.p) | tee out/SHA256SUMS.module.txt
+          while read -r l; do echo "::notice title=module::$l"; done < out/SHA256SUMS.module.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module
+          path: out/
+
+  driver:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout PawnIO (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: namazso/PawnIO
+          ref: ${{ env.PAWNIO_COMMIT }}
+          submodules: recursive
+          path: PawnIO
+
+      - name: Create throwaway test-signing certificate
+        shell: pwsh
+        run: |
+          $c = New-SelfSignedCertificate -Type CodeSigningCert `
+                 -Subject 'CN=PawnIO Unrestricted HW-Test (throwaway CI key)' `
+                 -CertStoreLocation Cert:\CurrentUser\My -HashAlgorithm SHA256 `
+                 -NotAfter (Get-Date).AddDays(90)
+          New-Item -ItemType Directory out | Out-Null
+          Export-Certificate -Cert $c -FilePath out\PawnIO-HwTest.cer | Out-Null
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+                Sort-Object FullName | Select-Object -Last 1
+          if (-not $st) { "::error::signtool not found"; exit 1 }
+          "THUMB=$($c.Thumbprint)"   | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "SIGNTOOL=$($st.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          $lines = @(
+            '@echo off',
+            'copy /y "%~1" "%~2" >nul || exit /b 1',
+            ('"{0}" sign /fd SHA256 /s My /sha1 {1} "%~2"' -f $st.FullName, $c.Thumbprint)
+          )
+          Set-Content -Path sign.cmd -Value $lines -Encoding ascii
+          Get-Content sign.cmd
+
+      - name: Configure and build (PAWNIO_UNRESTRICTED=ON)
+        shell: pwsh
+        run: |
+          cmake -S PawnIO -B build -G "Visual Studio 17 2022" -A x64 `
+                -DPAWNIO_UNRESTRICTED=ON `
+                "-DPAWNIO_NAME_FULL=PawnIO UNRESTRICTED hardware-test build" `
+                "-DSIGN_SCRIPT=$PWD\sign.cmd" 2>&1 | Tee-Object cfg.log
+          if ($LASTEXITCODE) { Get-Content cfg.log -Tail 10 | ForEach-Object { "::error title=configure::$_" }; exit 1 }
+          cmake --build build --config Release --target PawnIO_CAB 2>&1 | Tee-Object build.log
+          if ($LASTEXITCODE) {
+            Select-String -Path build.log -Pattern ': error|error [A-Z]+[0-9]+|FAILED' |
+              Select-Object -First 10 | ForEach-Object { "::error title=build::$($_.Line.Trim())" }
+            exit 1
+          }
+
+      - name: Collect, sign catalog, record hashes
+        shell: pwsh
+        run: |
+          $d = 'build\PawnIO\driver'
+          Get-ChildItem $d | ForEach-Object { "::notice title=built::$($_.Name) $($_.Length) bytes" }
+          Copy-Item "$d\PawnIO.sys", "$d\PawnIO.inf", "$d\PawnIO.cat" out\
+          & $env:SIGNTOOL sign /fd SHA256 /s My /sha1 $env:THUMB out\PawnIO.cat
+          if ($LASTEXITCODE) { "::error::catalog signing failed"; exit 1 }
+          $s = Get-AuthenticodeSignature out\PawnIO.sys
+          "::notice title=sys signature::signer $($s.SignerCertificate.Thumbprint) (expected $env:THUMB)"
+          if ($s.SignerCertificate.Thumbprint -ne $env:THUMB) { "::error::PawnIO.sys is not signed with the test cert"; exit 1 }
+          @(
+            "PawnIO upstream commit: $env:PAWNIO_COMMIT",
+            'PAWNIO_UNRESTRICTED=ON (loads UNSIGNED modules - testing only)',
+            "Test cert thumbprint: $env:THUMB"
+          ) | Set-Content out\BUILD-INFO.txt
+          Get-ChildItem out -File | ForEach-Object {
+            "$((Get-FileHash $_.FullName).Hash.ToLower())  $($_.Name)"
+          } | Tee-Object -Variable sums | ForEach-Object { "::notice title=driver::$_" }
+          $sums | Set-Content out\SHA256SUMS.driver.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pawnio-unrestricted
+          path: out/
+
+  bundle:
+    needs: [module, driver]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bundle
+          merge-multiple: true
+      - run: ls -la bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HwTest-bundle
+          path: bundle/
