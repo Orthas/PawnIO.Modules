@@ -86,7 +86,7 @@ jobs:
         run: |
           cmake -S PawnIO -B build -G "Visual Studio 17 2022" -A x64 `
                 -DPAWNIO_UNRESTRICTED=ON `
-                "-DPAWNIO_NAME_FULL=PawnIO UNRESTRICTED hardware-test build" `
+                "-DPAWNIO_NAME_FULL=PawnIO-UNRESTRICTED-HWTEST" `
                 "-DSIGN_SCRIPT=$PWD\sign.cmd" 2>&1 | Tee-Object cfg.log
           if ($LASTEXITCODE) { Get-Content cfg.log -Tail 10 | ForEach-Object { "::error title=configure::$_" }; exit 1 }
           cmake --build build --config Release --target PawnIO_CAB 2>&1 | Tee-Object build.log
